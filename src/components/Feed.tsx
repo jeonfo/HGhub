@@ -643,7 +643,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
               )}
 
               {/* 渐变压暗，保证文字可读 */}
-              <div className="absolute inset-0 pointer-events-none"
+              <div className={`absolute inset-0 pointer-events-none${!isDesktop && fs ? (idle ? " transition-opacity duration-300 opacity-0" : " transition-opacity duration-300 opacity-100") : ""}`}
                 style={{ background: "linear-gradient(0deg, rgba(8,11,15,.86) 0, rgba(11,14,20,.18) 26%, transparent 48%)" }} />
 
               {/* 顶部 */}
