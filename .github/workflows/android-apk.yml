@@ -1,0 +1,112 @@
+name: Android APK (auto-hide fix)
+
+# 这个 workflow 只做两件事:把「安卓沉浸全屏播放条自动隐藏」补丁打进 Feed.tsx,然后打一个可直接安装的 APK。
+# 推到这个分支就会自动跑,也可以手动触发。
+on:
+  push:
+    branches: [fix/android-fullscreen-autohide]
+  workflow_dispatch:
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+
+jobs:
+  apk:
+    name: Build arm64 APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 应用全屏自动隐藏补丁
+        run: node fix-android-fullscreen-autohide.mjs
+
+      - name: 把修复提交回分支(权限不够就跳过,不挡打包)
+        continue-on-error: true
+        run: |
+          if git diff --quiet -- src/components/Feed.tsx; then echo "没有改动"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/components/Feed.tsx
+          git commit -m "fix(android): 沉浸全屏下播放条随闲置自动隐藏"
+          git push
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 准备 Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+            "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+          fi
+          NDK="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$NDK" ]; then echo "::error::runner 上没有 Android NDK"; exit 1; fi
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "NDK: $NDK"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: apk-arm64
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK(arm64)
+        run: pnpm tauri android build --apk --target aarch64
+
+      - name: 生成签名密钥并签名 APK
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/hghub.keystore"
+          keytool -genkeypair -v -keystore "$KS" -alias hghub -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass hghub2026 -keypass hghub2026 \
+            -dname "CN=HGhub, OU=Dev, O=HGhub, L=NA, S=NA, C=CN" >/dev/null
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          mkdir -p artifacts
+          found=0
+          for f in $(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' ! -name '*-signed.apk'); do
+            case "$f" in *release*|*universal*) ;; *) continue ;; esac
+            out="artifacts/HGhub_${V}_arm64.apk"
+            "$APKSIGNER" sign --ks "$KS" --ks-key-alias hghub \
+              --ks-pass pass:hghub2026 --key-pass pass:hghub2026 \
+              --v4-signing-enabled false --out "$out" "$f"
+            "$APKSIGNER" verify --print-certs "$out" | head -3
+            found=$((found+1))
+          done
+          rm -f "$KS"
+          if [ "$found" -eq 0 ]; then echo "::error::没有找到 APK"; find src-tauri/gen/android/app/build/outputs -name '*.apk'; exit 1; fi
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-apk
+          path: artifacts/*.apk
+          if-no-files-found: error
