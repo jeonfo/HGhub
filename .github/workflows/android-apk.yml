@@ -110,3 +110,17 @@ jobs:
           name: HGhub-apk
           path: artifacts/*.apk
           if-no-files-found: error
+      - name: 发布到 Release(公开下载)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          TAG="v${V}-autohide"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/*.apk --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" artifacts/*.apk --repo "$GITHUB_REPOSITORY" \
+              --title "HGhub $V(全屏播放条自动隐藏修复)" \
+              --notes "安卓沉浸全屏下,播放条 2.8 秒无操作自动隐藏;轻点画面唤回,这一下不会顺手暂停。"
+          fi
