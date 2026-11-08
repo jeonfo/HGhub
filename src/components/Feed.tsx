@@ -68,22 +68,25 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const fs = store.fs;
   const setFs = store.setFs;
 
-  /* 桌面：鼠标闲置 2.8s 自动隐藏播放器 UI（沉浸） */
+  /* 播放器 UI 闲置自动隐藏:桌面跟随鼠标;安卓在沉浸全屏里隐藏播放条(点一下画面唤回) */
   const [idle, setIdle] = useState(false);
   const idleTimer = useRef<number | undefined>(undefined);
+  const idleAtDown = useRef(false);
   const wake = useCallback(() => {
     setIdle(false);
     window.clearTimeout(idleTimer.current);
     idleTimer.current = window.setTimeout(() => setIdle(true), 2800);
   }, []);
   useEffect(() => {
-    if (!isDesktop) return undefined;
+    /* 安卓普通竖屏模式不接管:底部信息栏要常驻;只有沉浸全屏(fs)才自动隐藏播放条 */
+    if (!isDesktop && !fs) { setIdle(false); window.clearTimeout(idleTimer.current); return undefined; }
     wake();
     return () => window.clearTimeout(idleTimer.current);
-  }, [isDesktop, wake]);
+  }, [isDesktop, fs, wake]);
   useEffect(() => {
     if (paused) { setIdle(false); window.clearTimeout(idleTimer.current); }
-  }, [paused]);
+    else if (!isDesktop && fs) wake();
+  }, [paused, isDesktop, fs, wake]);
   const [fullscreen, setFullscreen] = useState(false);
   const [heartBurst, setHeartBurst] = useState(0);
   /* —— 移动端手势 —— */
@@ -322,6 +325,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   /* —— 长按 2x（上滑锁定） / 横拖定位 / 单击暂停 —— */
   const onDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isDesktop) return;
+    /* 记下按下前播放条是否已隐藏:隐藏时第一下只负责唤回,不顺手暂停 */
+    idleAtDown.current = idle;
+    wake();
     const el = e.currentTarget;
     const width = el.clientWidth || 1;
     try { el.setPointerCapture(e.pointerId); } catch { /* ignore */ }
@@ -403,7 +409,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       if (!paused) videoRef.current?.play();
       return;
     }
-    if (Date.now() - g.t < 260) videoRef.current?.toggle();
+    if (Date.now() - g.t < 260) {
+      /* 沉浸全屏里播放条正隐藏着:这一下只把它唤回来,不改播放状态 */
+      if (!isDesktop && fs && idleAtDown.current) { wake(); return; }
+      videoRef.current?.toggle();
+    }
   };
 
   /* 长按倍速期间禁止原生滚动，否则上滑会被列表吃掉、锁不住倍速 */
@@ -434,12 +444,14 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   };
   const onBarDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.stopPropagation();
+    wake();
     barScrub.current = true;
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch { /* ignore */ }
     barSeekTo(e.clientX, e.clientY);
   };
   const onBarMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!barScrub.current) return;
+    wake();
     e.stopPropagation();
     barSeekTo(e.clientX, e.clientY);
   };
@@ -506,8 +518,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   return (
     <div
-      className={`hg-player-ui absolute inset-0 overflow-hidden bg-black player-root ${isDesktop ? "player-surface" : ""} ${theater ? "is-theater" : ""} ${rotated ? "fs-landscape" : ""} ${isDesktop && idle ? "is-idle" : ""}`}
-      onPointerMove={() => { if (isDesktop) wake(); }}>
+      className={`hg-player-ui absolute inset-0 overflow-hidden bg-black player-root ${isDesktop ? "player-surface" : ""} ${theater ? "is-theater" : ""} ${rotated ? "fs-landscape" : ""} ${idle ? "is-idle" : ""}`}
+      onPointerMove={() => { if (isDesktop) wake(); }}
+      onPointerDown={() => { if (!isDesktop) wake(); }}>
       {/* 氛围背景 */}
       <div className="absolute inset-0 scale-110 blur-3xl opacity-25 pointer-events-none">
         {posterUrl && <img src={posterUrl} alt="" className="w-full h-full object-cover" />}
@@ -789,7 +802,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
       {/* 移动端全屏模式下的进度条（普通模式的进度条在底部灰块里） */}
       {!isDesktop && fs && (
-        <div className="absolute inset-x-0 z-30 px-4" style={{ bottom: "calc(var(--sab, 0px) + 52px)", height: 22 }}>
+        <div className={`absolute inset-x-0 z-30 px-4 transition-opacity duration-300 ${idle ? "opacity-0 pointer-events-none" : "opacity-100"}`}
+          style={{ bottom: "calc(var(--sab, 0px) + 52px)", height: 22 }}>
           <div ref={barRef} className="relative h-full" style={{ touchAction: "none" }}
             onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarUp}>
             <div className="absolute inset-x-0 bottom-[8px] h-[2.5px] rounded-full" style={{ background: "rgba(255,255,255,.3)" }}>
@@ -803,11 +817,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       {!isDesktop && fs && (
         <>
           <button onClick={() => setFs(false)} aria-label="退出全屏"
-            className="hg-chip-strong absolute right-3 z-40 w-9 h-9 rounded-full backdrop-blur-md flex items-center justify-center pressable elev-1"
+            className={`hg-chip-strong absolute right-3 z-40 w-9 h-9 rounded-full backdrop-blur-md flex items-center justify-center pressable elev-1 transition-opacity duration-300 ${idle ? "opacity-0 pointer-events-none" : "opacity-100"}`}
             style={{ top: "calc(var(--sat, 0px) + 6px)" }}>
             <ICompress size={18} />
           </button>
-          <div className="absolute inset-x-0 z-40 flex items-center gap-3 px-4"
+          <div className={`absolute inset-x-0 z-40 flex items-center gap-3 px-4 transition-opacity duration-300 ${idle ? "opacity-0 pointer-events-none" : "opacity-100"}`}
             style={{ bottom: "calc(var(--sab, 0px) + 10px)" }}>
             <button onClick={() => videoRef.current?.toggle()}
               className="hg-chip shrink-0 w-9 h-9 rounded-full flex items-center justify-center pressable">
