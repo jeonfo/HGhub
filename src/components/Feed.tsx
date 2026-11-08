@@ -29,6 +29,8 @@ type Props = {
 };
 
 const RATES = [1, 1.25, 1.5, 2];
+/** 双击快进的秒数:想用 5 秒就把这里改成 5 */
+const SEEK_STEP = 10;
 
 const stripHtml = (s: string) => s.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
 
@@ -95,6 +97,28 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [lockArmed, setLockArmed] = useState(false);
   const holdRef = useRef(false);
   const lockArmedRef = useRef(false);
+  /* —— 双击快进 / 双指放大 —— */
+  const [seekHint, setSeekHint] = useState<{ dir: number; n: number; key: number } | null>(null);
+  const hintTimer = useRef<number | undefined>(undefined);
+  const [zoom, setZoom] = useState(1);
+  const doubleTap = useRef<{ t: number; x: number; y: number; timer: number | null }>({ t: 0, x: 0, y: 0, timer: null });
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef<{ dist: number; zoom: number } | null>(null);
+  /** 撤掉还没兑现的那次单击(双击、横拖、上滑时用) */
+  const cancelPendingTap = () => {
+    const d = doubleTap.current;
+    if (d.timer) { window.clearTimeout(d.timer); doubleTap.current = { t: 0, x: 0, y: 0, timer: null }; }
+  };
+  /** 双击快进/快退:夹在 0 与片尾前 0.2 秒之间,并弹一下提示 */
+  const seekBy = (delta: number) => {
+    const d = duration || 0;
+    const t = Math.max(0, d > 0 ? Math.min(d - 0.2, time + delta) : time + delta);
+    videoRef.current?.seek(t);
+    setTime(t);
+    setSeekHint({ dir: delta >= 0 ? 1 : -1, n: Math.abs(delta), key: Date.now() });
+    window.clearTimeout(hintTimer.current);
+    hintTimer.current = window.setTimeout(() => setSeekHint(null), 700);
+  };
   const [scrub, setScrub] = useState<{ pct: number; target: number } | null>(null);
   const scrubTarget = useRef<number | null>(null);
   /* 进度条拖动 */
@@ -256,6 +280,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   useEffect(() => {
     setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
     setVsize({ w: 0, h: 0 });
+    /* 换集/换片:把双指放大复位 */
+    setZoom(1); pinch.current = null; pointers.current.clear();
   }, [playKey]);
 
   /* 音量/静音同步 */
@@ -328,6 +354,21 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     /* 记下按下前播放条是否已隐藏:隐藏时第一下只负责唤回,不顺手暂停 */
     idleAtDown.current = idle;
     wake();
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.current.size === 2) {
+      /* 双指:放弃长按/横拖,改走「双指放大」 */
+      if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
+      gesture.current = null;
+      holdRef.current = false;
+      setHoldSpeed(false);
+      setLockArmed(false);
+      lockArmedRef.current = false;
+      cancelPendingTap();
+      const pts = [...pointers.current.values()];
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
+      pinch.current = { dist, zoom };
+      return;
+    }
     const el = e.currentTarget;
     const width = el.clientWidth || 1;
     try { el.setPointerCapture(e.pointerId); } catch { /* ignore */ }
@@ -349,8 +390,18 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   };
 
   const onMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (isDesktop) return;
+    if (pointers.current.has(e.pointerId)) pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const pin = pinch.current;
+    if (pin && pointers.current.size >= 2) {
+      /* 双指放大:1x ~ 3.5x,以画面中心为基准 */
+      const pts = [...pointers.current.values()];
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
+      setZoom(Math.max(1, Math.min(3.5, (pin.zoom * dist) / pin.dist)));
+      return;
+    }
     const g = gesture.current;
-    if (!g || isDesktop) return;
+    if (!g) return;
     const dx = e.clientX - g.x;
     const dy = e.clientY - g.y;
 
@@ -367,10 +418,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (g.mode === "idle") {
       if (Math.abs(dx) > 14 && Math.abs(dx) > Math.abs(dy)) {
         if (g.timer) window.clearTimeout(g.timer);
+        cancelPendingTap();
         g.mode = "scrub";
         videoRef.current?.pause();
       } else if (Math.abs(dy) > 14) {
         if (g.timer) window.clearTimeout(g.timer);
+        cancelPendingTap();
       }
       return;
     }
@@ -384,7 +437,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     }
   };
 
-  const onUp = () => {
+  const onUp = (e?: React.PointerEvent<HTMLDivElement>) => {
+    if (e) pointers.current.delete(e.pointerId);
+    if (pinch.current) {
+      /* 双指缩放结束:不改播放状态,也不算单击 */
+      if (pointers.current.size < 2) pinch.current = null;
+      return;
+    }
     const g = gesture.current;
     gesture.current = null;
     if (!g) return;
@@ -412,7 +471,22 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (Date.now() - g.t < 260) {
       /* 沉浸全屏里播放条正隐藏着:这一下只把它唤回来,不改播放状态 */
       if (!isDesktop && fs && idleAtDown.current) { wake(); return; }
-      videoRef.current?.toggle();
+      /* 双击快进:320ms 内、落点相近的第二下 → 快进 SEEK_STEP 秒,并吃掉这一下单击 */
+      const now = Date.now();
+      const prev = doubleTap.current;
+      const near = Math.abs(g.x - prev.x) < 96 && Math.abs(g.y - prev.y) < 96;
+      if (prev.timer && now - prev.t < 320 && near) {
+        cancelPendingTap();
+        seekBy(SEEK_STEP);
+        return;
+      }
+      doubleTap.current = {
+        t: now, x: g.x, y: g.y,
+        timer: window.setTimeout(() => {
+          doubleTap.current = { t: 0, x: 0, y: 0, timer: null };
+          videoRef.current?.toggle();
+        }, 300) as unknown as number,
+      };
     }
   };
 
@@ -421,7 +495,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (isDesktop) return undefined;
     const el = boxRef.current;
     if (!el) return undefined;
-    const fn = (e: TouchEvent) => { if (holdRef.current) e.preventDefault(); };
+    const fn = (e: TouchEvent) => { if (holdRef.current || pinch.current) e.preventDefault(); };
     el.addEventListener("touchmove", fn, { passive: false });
     return () => el.removeEventListener("touchmove", fn);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -534,7 +608,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           return (
             <section key={vid} className="relative w-full h-full snap-start snap-always overflow-hidden">
               {isActive && playUrl ? (
-                <div className="absolute inset-0" style={{ touchAction: "pan-y" }}
+                <div className="absolute inset-0"
+                  style={{ touchAction: "pan-y", transform: zoom > 1 ? `scale(${zoom})` : undefined }}
                   onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}>
                 <VideoSurface ref={videoRef} src={playUrl} poster={posterUrl} autoPlay muted={muted}
                   volume={volume} rate={effRate}
@@ -716,6 +791,16 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                 </div>
               )}
 
+
+              {/* 双击快进提示 */}
+              {!isDesktop && seekHint && (
+                <div className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none">
+                  <span key={seekHint.key}
+                    className="px-4 h-10 rounded-full flex items-center gap-1 backdrop-blur-md hg-chip-strong text-[13.5px] font-bold hg-ink-2 tabular-nums">
+                    {seekHint.dir > 0 ? "快进" : "快退"} {seekHint.n} 秒
+                  </span>
+                </div>
+              )}
 
               {/* 横拖定位浮层 */}
               {!isDesktop && scrub && (
