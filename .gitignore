@@ -27,3 +27,6 @@ Thumbs.db
 
 # API
 docs/API.md
+
+# 本地工具链数据（会话记忆 / 工作区笔记，不进版本库）
+.workbuddy-ai/
