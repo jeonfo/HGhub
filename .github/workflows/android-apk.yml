@@ -103,11 +103,13 @@ jobs:
           else
             # 首次自举:只在 runner 上生成一次,密钥与口令作为私有 artifact 交付
             KS_PASS="$(openssl rand -hex 24)"
-            KEY_PASS="$(openssl rand -hex 24)"
+            # PKCS12 不支持 store/key 用不同口令:keytool 会忽略 -keypass,
+            # apksigner 再拿另一个口令取私钥就会 BadPaddingException。两者必须一致。
+            KEY_PASS="$KS_PASS"
             KS_ALIAS="hghub"
             keytool -genkeypair -v -keystore "$KS" -alias "$KS_ALIAS" \
               -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -storepass "$KS_PASS" \
               -dname "CN=HGhub, OU=Dev, O=HGhub, L=NA, S=NA, C=CN" >/dev/null
             mkdir -p signing-bootstrap
             base64 -w0 "$KS" > signing-bootstrap/ANDROID_KEYSTORE_BASE64.txt
