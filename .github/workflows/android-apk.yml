@@ -2,6 +2,21 @@ name: Android APK (manual build)
 
 # 手动触发:仓库 Actions 页 → 这个 workflow → Run workflow。
 # 从当前 main 源码直接打一个可安装的 arm64 APK,并发布到 GitHub Release(标签 v<版本>-apk)。
+#
+# ── 固定签名 ─────────────────────────────────────────────────────────────
+# 配好下面 4 个 Repository Secrets 后,每次出包都用同一把密钥,可直接覆盖安装:
+#   ANDROID_KEYSTORE_BASE64    keystore 文件的 base64(单行文本)
+#   ANDROID_KEYSTORE_PASSWORD  密钥库口令
+#   ANDROID_KEY_ALIAS          密钥别名
+#   ANDROID_KEY_PASSWORD       私钥口令
+#
+# 一个都没配时本 workflow 会「自举」:生成一把新密钥,把 4 个值打包成私有
+# artifact `signing-key-bootstrap`,并在 Job Summary 里给出提示。这一次产物
+# 仍然是临时签名 —— 下载该 artifact、把 4 个 .txt 的内容写进同名 Secret 后,
+# 后续构建的签名才固定。
+#
+# 注意:历史上用「每次临时生成」的密钥装过的版本,仍需先卸载一次,这是最后一次。
+# ─────────────────────────────────────────────────────────────────────────
 on:
   workflow_dispatch:
 
@@ -65,13 +80,55 @@ jobs:
       - name: 编译 APK(arm64)
         run: pnpm tauri android build --apk --target aarch64
 
-      - name: 生成签名密钥并签名 APK
+      - name: 配置签名密钥并签名 APK
+        id: sign
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           KS="$RUNNER_TEMP/hghub.keystore"
-          keytool -genkeypair -v -keystore "$KS" -alias hghub -keyalg RSA -keysize 2048 \
-            -validity 10000 -storepass hghub2026 -keypass hghub2026 \
-            -dname "CN=HGhub, OU=Dev, O=HGhub, L=NA, S=NA, C=CN" >/dev/null
+          MODE="bootstrap"
+
+          if [ -n "$KS_B64" ]; then
+            if [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ] || [ -z "$KEY_PASS" ]; then
+              echo "::error::ANDROID_KEYSTORE_BASE64 已配置,但另外 3 个签名 Secret 有缺失"
+              exit 1
+            fi
+            printf '%s' "$KS_B64" | base64 -d > "$KS"
+            MODE="fixed"
+            echo "::notice::使用仓库 Secret 里的固定签名密钥,产物可直接覆盖安装"
+          else
+            # 首次自举:只在 runner 上生成一次,密钥与口令作为私有 artifact 交付
+            KS_PASS="$(openssl rand -hex 24)"
+            KEY_PASS="$(openssl rand -hex 24)"
+            KS_ALIAS="hghub"
+            keytool -genkeypair -v -keystore "$KS" -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=HGhub, OU=Dev, O=HGhub, L=NA, S=NA, C=CN" >/dev/null
+            mkdir -p signing-bootstrap
+            base64 -w0 "$KS" > signing-bootstrap/ANDROID_KEYSTORE_BASE64.txt
+            printf '%s' "$KS_PASS" > signing-bootstrap/ANDROID_KEYSTORE_PASSWORD.txt
+            printf '%s' "$KS_ALIAS" > signing-bootstrap/ANDROID_KEY_ALIAS.txt
+            printf '%s' "$KEY_PASS" > signing-bootstrap/ANDROID_KEY_PASSWORD.txt
+            {
+              printf '%s\n' '## ⚠️ 本次 APK 仍是临时签名' '' \
+                '下载 artifact `signing-key-bootstrap`,把 4 个 .txt 的内容分别写入同名 Repository Secret;' \
+                '之后每次构建都用同一把密钥,产物可直接覆盖安装。' \
+                '历史上用临时密钥装过的版本,仍需先卸载一次。'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::未配置签名 Secrets,本次为首次自举签名;请下载 signing-key-bootstrap 并配置 Secret"
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          # apksigner 的 file: 格式按「单行」读取,这里带换行;
+          # artifact 里的 .txt 保持无换行,免得写进 Secret 时多出字符。
+          printf '%s\n' "$KS_PASS" > "$RUNNER_TEMP/ks.storepass"
+          printf '%s\n' "$KEY_PASS" > "$RUNNER_TEMP/ks.keypass"
+
           BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
           V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
@@ -80,16 +137,25 @@ jobs:
           for f in $(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' ! -name '*-signed.apk'); do
             case "$f" in *release*|*universal*) ;; *) continue ;; esac
             out="artifacts/HGhub_${V}_arm64.apk"
-            "$APKSIGNER" sign --ks "$KS" --ks-key-alias hghub \
-              --ks-pass pass:hghub2026 --key-pass pass:hghub2026 \
+            "$APKSIGNER" sign --ks "$KS" --ks-key-alias "$KS_ALIAS" \
+              --ks-pass "file:$RUNNER_TEMP/ks.storepass" \
+              --key-pass "file:$RUNNER_TEMP/ks.keypass" \
               --v4-signing-enabled false --out "$out" "$f"
             "$APKSIGNER" verify --print-certs "$out" | head -3
             found=$((found+1))
           done
-          rm -f "$KS"
+          rm -f "$KS" "$RUNNER_TEMP/ks.storepass" "$RUNNER_TEMP/ks.keypass"
           if [ "$found" -eq 0 ]; then echo "::error::没有找到 APK"; find src-tauri/gen/android/app/build/outputs -name '*.apk'; exit 1; fi
           sha256sum artifacts/*.apk | tee artifacts/SHA256SUMS.txt
           ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        if: steps.sign.outputs.mode == 'bootstrap'
+        with:
+          name: signing-key-bootstrap
+          path: signing-bootstrap/*.txt
+          if-no-files-found: error
+          retention-days: 7
 
       - uses: actions/upload-artifact@v4
         with:
@@ -100,14 +166,20 @@ jobs:
       - name: 发布到 Release(公开下载)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGN_MODE: ${{ steps.sign.outputs.mode }}
         run: |
           set -euo pipefail
           V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           TAG="v${V}-apk"
+          if [ "$SIGN_MODE" = "fixed" ]; then
+            NOTES="从 main 源码手动构建的 Android arm64 APK。签名密钥固定在仓库 Secrets,可直接覆盖安装。"
+          else
+            NOTES="从 main 源码手动构建的 Android arm64 APK。⚠️ 本次为首次自举签名(临时密钥),请下载 signing-key-bootstrap 并配置签名 Secrets;装过旧版临时签名包时需先卸载一次。"
+          fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" artifacts/*.apk --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" artifacts/*.apk --repo "$GITHUB_REPOSITORY" \
               --title "HGhub $V · Android APK" \
-              --notes "从 main 源码手动构建的 Android arm64 APK(签名密钥为构建时临时生成;重装需先卸载旧包)。"
+              --notes "$NOTES"
           fi
