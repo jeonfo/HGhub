@@ -7,20 +7,17 @@ mod session;
 use api::Api;
 use tauri::Manager;
 
-/// 播放地址(站点新接口适配)。
+/// 播放地址(站点新接口适配):站点把播放请求挪到了
+/// `POST /api/videos/{id}/episodes/{ep}/playback`,回传 `data.streams.{main,hevc,preview}`;
+/// 旧的 `GET /api/videos/{id}/play?ep=..` 现在虽然还是 status 1,但 video_url 一律是空串,
+/// 前端于是报「暂无播放地址」。所以这里先打新接口,把 streams.main / streams.hevc 回填成
+/// 前端已经在读的 video_url / video_url_hevc;新接口没戏时退回旧接口;
+/// 两边都取不到地址就明确报错,而不是把空串交给前端。
 ///
-/// 站点把播放请求挪到了 `POST /api/videos/{id}/episodes/{ep}/playback`,回传
-/// `data.streams.{main,hevc,preview}`;旧的 `GET /api/videos/{id}/play?ep=..`
-/// 现在虽然还是 `status: 1`,但 `video_url` 一律是空串,前端于是报「暂无播放地址」。
-///
-/// 这里先打新接口,把 `streams.main` / `streams.hevc` 回填成前端已经在读的
-/// `video_url` / `video_url_hevc`(前端与自检都不用改);新接口没戏(旧线路)时
-/// 退回旧接口;两边都拿不到地址就明确报错,而不是把空串交给前端。
-///
-/// 命令名与参数保持 `api_play` / `{ id, ep }`,所以 src/api.ts 与 Feed.tsx 不动。
-/// (src-tauri/src/api.rs 里那份旧的 `api_play` 已不再注册,保留作对照。)
+/// 命令名用 api_play_v2(参数仍是 id / ep):Tauri 的命令宏按函数名生成,
+/// 与 api.rs 里那份旧的播放命令同名会撞车,所以换个名字,前端 src/api.ts 同步改调用名。
 #[tauri::command]
-pub async fn api_play(id: i64, ep: u32) -> Result<serde_json::Value, String> {
+pub async fn api_play_v2(id: i64, ep: u32) -> Result<serde_json::Value, String> {
     use serde_json::{json, Value};
 
     let path = format!("/api/videos/{id}/episodes/{ep}/playback");
@@ -119,7 +116,7 @@ pub fn run() {
             api::api_post_collect,
             api::api_post_comments,
             api::api_video,
-            api_play,
+            api_play_v2,
             api::api_comments,
             api::api_comment_send,
             api::api_like,
